@@ -1,0 +1,2144 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+import os
+import socket
+import qrcode
+import base64
+import urllib.request
+import hashlib
+import subprocess
+import sys
+
+from datetime import datetime
+from pathlib import Path
+from fashn import Fashn
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path.home() / "ARVirtuelFittingMirror"
+
+CLOTHES_FOLDER = BASE_DIR / "clothes" / "transparent"
+PHOTO_FOLDER = BASE_DIR / "photos"
+RESULT_FOLDER = BASE_DIR / "photos" / "fashn_results"
+
+PHOTO_FOLDER.mkdir(parents=True, exist_ok=True)
+RESULT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# FASHN API KEY
+# ============================================================
+
+API_KEY = os.environ.get("FASHN_API_KEY")
+
+if not API_KEY:
+
+    key_file = BASE_DIR / "fashn_api_key.txt"
+
+    if key_file.exists():
+        API_KEY = key_file.read_text().strip()
+
+
+if not API_KEY:
+
+    print("")
+    print("================================")
+    print("ERROR: FASHN API KEY IS MISSING")
+    print("================================")
+    print("")
+    sys.exit(1)
+
+
+fashn_client = Fashn(
+    api_key=API_KEY
+)
+
+
+# ============================================================
+# LOAD CLOTHES
+# ============================================================
+
+clothes = []
+
+for filename in sorted(
+    os.listdir(CLOTHES_FOLDER)
+):
+
+    if filename.lower().endswith(".png"):
+
+        path = CLOTHES_FOLDER / filename
+
+        image = cv2.imread(
+            str(path),
+            cv2.IMREAD_UNCHANGED
+        )
+
+        if image is not None:
+
+            clothes.append(
+                (
+                    filename,
+                    image,
+                    str(path)
+                )
+            )
+
+
+if not clothes:
+
+    print("")
+    print("ERROR: No clothes found.")
+    print(
+        "Check:",
+        CLOTHES_FOLDER
+    )
+    print("")
+
+    sys.exit(1)
+
+
+print("")
+print("================================")
+print("CLOTHES FOUND")
+print("================================")
+
+for i, (name, image, path) in enumerate(
+    clothes
+):
+
+    print(
+        i + 1,
+        "-",
+        name
+    )
+
+print("================================")
+print("")
+
+
+# ============================================================
+# MEDIAPIPE
+# ============================================================
+
+mp_pose = mp.solutions.pose
+mp_draw = mp.solutions.drawing_utils
+
+pose = mp_pose.Pose(
+
+    static_image_mode=False,
+
+    model_complexity=1,
+
+    smooth_landmarks=True,
+
+    enable_segmentation=True,
+
+    min_detection_confidence=0.5,
+
+    min_tracking_confidence=0.5
+)
+
+
+# ============================================================
+# VARIABLES
+# ============================================================
+
+current_cloth = 0
+
+show_landmarks = False
+
+take_photo = False
+
+window_width = 1280
+
+window_height = 720
+
+original_model_path = None
+
+current_result_path = None
+
+processing = False
+
+
+# ============================================================
+# BASIC FUNCTIONS
+# ============================================================
+
+def distance(p1, p2):
+
+    return math.sqrt(
+
+        (p1[0] - p2[0]) ** 2
+
+        +
+
+        (p1[1] - p2[1]) ** 2
+
+    )
+
+
+def prepare_cloth(image):
+
+    if image.shape[2] == 3:
+
+        image = cv2.cvtColor(
+
+            image,
+
+            cv2.COLOR_BGR2BGRA
+
+        )
+
+    alpha = image[:, :, 3]
+
+    coords = cv2.findNonZero(
+
+        (alpha > 10).astype(
+            np.uint8
+        )
+
+    )
+
+    if coords is not None:
+
+        x, y, w, h = cv2.boundingRect(
+            coords
+        )
+
+        image = image[
+            y:y + h,
+            x:x + w
+        ]
+
+    return image
+
+
+def resize_cloth(image, width):
+
+    h, w = image.shape[:2]
+
+    if w <= 0:
+        return image
+
+    ratio = width / w
+
+    new_height = int(
+        h * ratio
+    )
+
+    return cv2.resize(
+
+        image,
+
+        (
+            width,
+            new_height
+        ),
+
+        interpolation=cv2.INTER_AREA
+
+    )
+
+
+def overlay_transparent(
+    background,
+    overlay,
+    x,
+    y
+):
+
+    if overlay.shape[2] == 3:
+
+        overlay = cv2.cvtColor(
+
+            overlay,
+
+            cv2.COLOR_BGR2BGRA
+
+        )
+
+    h, w = overlay.shape[:2]
+
+    bg_h, bg_w = background.shape[:2]
+
+    x1 = max(x, 0)
+
+    y1 = max(y, 0)
+
+    x2 = min(
+        x + w,
+        bg_w
+    )
+
+    y2 = min(
+        y + h,
+        bg_h
+    )
+
+    if x1 >= x2 or y1 >= y2:
+
+        return background
+
+    ox1 = x1 - x
+
+    oy1 = y1 - y
+
+    ox2 = ox1 + (x2 - x1)
+
+    oy2 = oy1 + (y2 - y1)
+
+    crop = overlay[
+        oy1:oy2,
+        ox1:ox2
+    ]
+
+    alpha = (
+        crop[:, :, 3]
+        /
+        255.0
+    )
+
+    for c in range(3):
+
+        background[
+            y1:y2,
+            x1:x2,
+            c
+        ] = (
+
+            alpha * crop[:, :, c]
+
+            +
+
+            (1 - alpha)
+
+            *
+
+            background[
+                y1:y2,
+                x1:x2,
+                c
+            ]
+
+        )
+
+    return background
+
+
+# ============================================================
+# FIND LAST PHOTO
+# ============================================================
+
+def find_last_original_photo():
+
+    files = []
+
+    for filename in os.listdir(
+        PHOTO_FOLDER
+    ):
+
+        if (
+
+            filename.startswith(
+                "original_model_"
+            )
+
+            and
+
+            filename.lower().endswith(
+                ".jpg"
+            )
+
+        ):
+
+            path = (
+                PHOTO_FOLDER
+                /
+                filename
+            )
+
+            files.append(
+                str(path)
+            )
+
+    if not files:
+
+        return None
+
+    files.sort(
+        key=os.path.getmtime,
+        reverse=True
+    )
+
+    return files[0]
+
+
+# ============================================================
+# NETWORK / CURRENT MAC IP
+# ============================================================
+
+def get_local_ip():
+
+    try:
+
+        route_output = subprocess.check_output(
+
+            [
+                "/sbin/route",
+                "-n",
+                "get",
+                "default"
+            ],
+
+            text=True
+
+        )
+
+        interface = None
+
+        for line in route_output.splitlines():
+
+            line = line.strip()
+
+            if line.startswith(
+                "interface:"
+            ):
+
+                interface = (
+                    line
+                    .split(
+                        ":",
+                        1
+                    )[1]
+                    .strip()
+                )
+
+                break
+
+        if interface:
+
+            ip = subprocess.check_output(
+
+                [
+                    "/usr/sbin/ipconfig",
+                    "getifaddr",
+                    interface
+                ],
+
+                text=True
+
+            ).strip()
+
+            if ip:
+
+                return ip
+
+    except Exception:
+        pass
+
+
+    # Wi-Fi fallback
+    try:
+
+        ip = subprocess.check_output(
+
+            [
+                "/usr/sbin/ipconfig",
+                "getifaddr",
+                "en0"
+            ],
+
+            text=True
+
+        ).strip()
+
+        if ip:
+
+            return ip
+
+    except Exception:
+        pass
+
+
+    return "127.0.0.1"
+
+
+# ============================================================
+# QR CODE
+# ============================================================
+
+def create_qr(filename):
+
+    ip = get_local_ip()
+
+    url = (
+
+        f"http://{ip}:5000/"
+        f"results/{filename}"
+
+    )
+
+    print("")
+    print("================================")
+    print("QR LINK:")
+    print(url)
+    print("================================")
+    print("")
+
+    qr = qrcode.QRCode(
+
+        version=1,
+
+        box_size=8,
+
+        border=3
+
+    )
+
+    qr.add_data(url)
+
+    qr.make(
+        fit=True
+    )
+
+    qr_image = qr.make_image()
+
+    qr_image = qr_image.resize(
+        (350, 350)
+    )
+
+    qr_image = np.array(
+        qr_image.convert(
+            "RGB"
+        )
+    )
+
+    qr_image = cv2.cvtColor(
+        qr_image,
+        cv2.COLOR_RGB2BGR
+    )
+
+    cv2.namedWindow(
+        "QR CODE - SCAN WITH PHONE",
+        cv2.WINDOW_NORMAL
+    )
+
+    cv2.resizeWindow(
+        "QR CODE - SCAN WITH PHONE",
+        380,
+        380
+    )
+
+    cv2.imshow(
+        "QR CODE - SCAN WITH PHONE",
+        qr_image
+    )
+
+    cv2.waitKey(1)
+
+
+# ============================================================
+# SHOW FASHN RESULT
+# ============================================================
+
+def show_fashn_result(
+    result_path
+):
+
+    result_image = cv2.imread(
+        result_path
+    )
+
+    if result_image is None:
+
+        print(
+            "ERROR: Could not open FASHN result."
+        )
+
+        return
+
+
+    # Get original result size
+    result_h, result_w = (
+        result_image.shape[:2]
+    )
+
+
+    # Window size
+    max_width = 900
+    max_height = 700
+
+
+    scale = min(
+
+        max_width / result_w,
+
+        max_height / result_h,
+
+        1.0
+
+    )
+
+
+    display_width = int(
+        result_w * scale
+    )
+
+    display_height = int(
+        result_h * scale
+    )
+
+
+    if scale < 1.0:
+
+        display_image = cv2.resize(
+
+            result_image,
+
+            (
+                display_width,
+                display_height
+            ),
+
+            interpolation=cv2.INTER_AREA
+
+        )
+
+    else:
+
+        display_image = result_image
+
+
+    cv2.namedWindow(
+        "FASHN RESULT",
+        cv2.WINDOW_NORMAL
+    )
+
+    cv2.resizeWindow(
+
+        "FASHN RESULT",
+
+        display_width,
+
+        display_height
+
+    )
+
+    cv2.imshow(
+        "FASHN RESULT",
+        display_image
+    )
+
+    cv2.waitKey(1)
+
+
+# ============================================================
+# BASE64
+# ============================================================
+
+def image_to_base64(
+    filename
+):
+
+    with open(
+        filename,
+        "rb"
+    ) as file:
+
+        data = base64.b64encode(
+            file.read()
+        ).decode(
+            "utf-8"
+        )
+
+
+    if filename.lower().endswith(
+        ".png"
+    ):
+
+        mime = "image/png"
+
+    else:
+
+        mime = "image/jpeg"
+
+
+    return (
+        f"data:{mime};base64,{data}"
+    )
+
+
+# ============================================================
+# PERMANENT CACHE
+# ============================================================
+
+def get_cache_filename(
+
+    model_path,
+
+    garment_path
+
+):
+
+    hash_object = hashlib.sha256()
+
+
+    with open(
+        model_path,
+        "rb"
+    ) as f:
+
+        hash_object.update(
+            f.read()
+        )
+
+
+    with open(
+        garment_path,
+        "rb"
+    ) as f:
+
+        hash_object.update(
+            f.read()
+        )
+
+
+    key = hash_object.hexdigest()[:20]
+
+
+    return os.path.join(
+
+        str(RESULT_FOLDER),
+
+        f"tryon_{key}.jpg"
+
+    )
+
+
+# ============================================================
+# PROCESS CURRENT CLOTH
+# ============================================================
+
+def process_current_cloth():
+
+    global processing
+
+    global current_result_path
+
+
+    if original_model_path is None:
+
+        print("")
+        print(
+            "TAKE PHOTO FIRST."
+        )
+        print("")
+
+        return
+
+
+    if processing:
+
+        return
+
+
+    processing = True
+
+
+    cloth_name, cloth_image, cloth_path = clothes[
+        current_cloth
+    ]
+
+
+    cache_path = get_cache_filename(
+
+        original_model_path,
+
+        cloth_path
+
+    )
+
+
+    # ========================================================
+    # CACHE EXISTS
+    # ========================================================
+
+    if os.path.exists(
+        cache_path
+    ):
+
+        print("")
+        print("================================")
+        print("CACHED RESULT")
+        print("================================")
+        print("")
+        print(
+            "Garment:",
+            cloth_name
+        )
+        print("")
+        print(
+            "No FASHN request."
+        )
+        print(
+            "Credits used: 0"
+        )
+        print("")
+
+
+        current_result_path = (
+            cache_path
+        )
+
+
+        result_image = cv2.imread(
+            current_result_path
+        )
+
+
+        if result_image is not None:
+
+            show_fashn_result(
+                current_result_path
+            )
+
+            filename = (
+                os.path.basename(
+                    current_result_path
+                )
+            )
+
+            create_qr(
+                filename
+            )
+
+
+        processing = False
+
+        return
+
+
+    # ========================================================
+    # NEW FASHN REQUEST
+    # ========================================================
+
+    print("")
+    print("================================")
+    print("FASHN VIRTUAL TRY-ON")
+    print("================================")
+    print("")
+    print(
+        "Model:",
+        original_model_path
+    )
+    print(
+        "Garment:",
+        cloth_name
+    )
+    print("")
+    print("Preparing images...")
+    print("")
+    print("Sending to FASHN...")
+    print("")
+
+
+    try:
+
+        model_image = image_to_base64(
+            original_model_path
+        )
+
+        garment_image = image_to_base64(
+            cloth_path
+        )
+
+
+        result = (
+            fashn_client
+            .predictions
+            .subscribe(
+
+                model_name="tryon-v1.6",
+
+                inputs={
+
+                    "model_image":
+                        model_image,
+
+                    "garment_image":
+                        garment_image,
+
+                    "category":
+                        "tops",
+
+                    "garment_photo_type":
+                        "auto",
+
+                    "mode":
+                        "performance",
+
+                    "num_samples":
+                        1,
+
+                    "output_format":
+                        "jpeg"
+                }
+
+            )
+        )
+
+
+        print(
+            "FASHN STATUS:",
+            result.status
+        )
+
+
+        if result.status != "completed":
+
+            print("")
+            print("================================")
+            print("FASHN FAILED")
+            print("================================")
+            print("")
+            print(result)
+            print("")
+
+            processing = False
+
+            return
+
+
+        output_url = (
+            result.output[0]
+        )
+
+
+        print("")
+        print("================================")
+        print("FASHN SUCCESS!")
+        print("================================")
+        print("")
+        print(
+            "Credits used:",
+            result.credits_used
+        )
+        print("")
+
+
+        # ====================================================
+        # SAVE PERMANENTLY
+        # ====================================================
+
+        urllib.request.urlretrieve(
+
+            output_url,
+
+            cache_path
+
+        )
+
+
+        current_result_path = (
+            cache_path
+        )
+
+
+        print(
+            "RESULT SAVED:"
+        )
+
+        print(
+            current_result_path
+        )
+
+        print("")
+        print(
+            "CACHED PERMANENTLY."
+        )
+
+        print(
+            "Next time:"
+        )
+
+        print(
+            "Credits used: 0"
+        )
+
+        print("")
+
+
+        # ====================================================
+        # SHOW RESULT
+        # ====================================================
+
+        show_fashn_result(
+            current_result_path
+        )
+
+
+        # ====================================================
+        # QR
+        # ====================================================
+
+        filename = (
+            os.path.basename(
+                current_result_path
+            )
+        )
+
+
+        create_qr(
+            filename
+        )
+
+
+        print("")
+        print("================================")
+        print("TRY-ON COMPLETE")
+        print("================================")
+        print("")
+        print(
+            "Press Q or ESC in the "
+            "camera/result windows to quit."
+        )
+        print("")
+
+
+    except Exception as e:
+
+        print("")
+        print("================================")
+        print("FASHN ERROR")
+        print("================================")
+        print("")
+        print(e)
+        print("")
+
+
+    processing = False
+
+
+# ============================================================
+# USE LAST PHOTO
+# ============================================================
+
+def use_last_photo():
+
+    global original_model_path
+
+    global current_result_path
+
+
+    last_photo = (
+        find_last_original_photo()
+    )
+
+
+    if last_photo is None:
+
+        print("")
+        print(
+            "NO PREVIOUS PHOTO FOUND."
+        )
+        print("")
+
+        return
+
+
+    original_model_path = (
+        last_photo
+    )
+
+    current_result_path = None
+
+
+    print("")
+    print("================================")
+    print("LAST PHOTO LOADED")
+    print("================================")
+    print("")
+    print(
+        original_model_path
+    )
+    print("")
+    print(
+        "You can now use NEXT / PREVIOUS."
+    )
+    print("")
+
+
+    process_current_cloth()
+
+
+# ============================================================
+# MOUSE
+# ============================================================
+
+def mouse_callback(
+
+    event,
+
+    x,
+
+    y,
+
+    flags,
+
+    param
+
+):
+
+    global current_cloth
+
+    global show_landmarks
+
+    global take_photo
+
+
+    if event != cv2.EVENT_LBUTTONDOWN:
+
+        return
+
+
+    height = window_height
+
+    width = window_width
+
+
+    # --------------------------------------------------------
+    # LAST PHOTO
+    # --------------------------------------------------------
+
+    if (
+
+        width // 2 - 110
+        <= x
+        <=
+        width // 2 + 110
+
+        and
+
+        height - 125
+        <= y
+        <=
+        height - 75
+
+    ):
+
+        use_last_photo()
+
+        return
+
+
+    # --------------------------------------------------------
+    # PREVIOUS
+    # --------------------------------------------------------
+
+    if (
+
+        20
+        <= x
+        <=
+        220
+
+        and
+
+        height - 125
+        <= y
+        <=
+        height - 75
+
+    ):
+
+        current_cloth -= 1
+
+
+        if current_cloth < 0:
+
+            current_cloth = (
+                len(clothes) - 1
+            )
+
+
+        if original_model_path is not None:
+
+            process_current_cloth()
+
+
+    # --------------------------------------------------------
+    # NEXT
+    # --------------------------------------------------------
+
+    elif (
+
+        width - 220
+        <= x
+        <=
+        width - 20
+
+        and
+
+        height - 125
+        <= y
+        <=
+        height - 75
+
+    ):
+
+        current_cloth += 1
+
+
+        if (
+            current_cloth
+            >=
+            len(clothes)
+        ):
+
+            current_cloth = 0
+
+
+        if original_model_path is not None:
+
+            process_current_cloth()
+
+
+    # --------------------------------------------------------
+    # HIDE TRACKING
+    # --------------------------------------------------------
+
+    elif (
+
+        20
+        <= x
+        <=
+        230
+
+        and
+
+        height - 65
+        <= y
+        <=
+        height - 15
+
+    ):
+
+        show_landmarks = (
+            not show_landmarks
+        )
+
+
+    # --------------------------------------------------------
+    # TAKE PHOTO
+    # --------------------------------------------------------
+
+    elif (
+
+        width - 230
+        <= x
+        <=
+        width - 20
+
+        and
+
+        height - 65
+        <= y
+        <=
+        height - 15
+
+    ):
+
+        take_photo = True
+
+
+# ============================================================
+# CAMERA
+# ============================================================
+
+cap = cv2.VideoCapture(0)
+
+
+cap.set(
+    cv2.CAP_PROP_FRAME_WIDTH,
+    1280
+)
+
+cap.set(
+    cv2.CAP_PROP_FRAME_HEIGHT,
+    720
+)
+
+
+if not cap.isOpened():
+
+    print(
+        "ERROR: Camera cannot be opened."
+    )
+
+    sys.exit(1)
+
+
+cv2.namedWindow(
+    "AR Virtual Fitting Mirror"
+)
+
+cv2.setMouseCallback(
+    "AR Virtual Fitting Mirror",
+    mouse_callback
+)
+
+
+print("")
+print("================================")
+print("AR VIRTUAL FITTING MIRROR")
+print("================================")
+print("")
+print(
+    "TAKE PHOTO = new model photo"
+)
+print(
+    "LAST PHOTO = reuse previous photo"
+)
+print(
+    "NEXT / PREVIOUS = change garment"
+)
+print("")
+print(
+    "Same photo + same garment = 0 credits"
+)
+print("")
+print(
+    "Press Q or ESC to quit."
+)
+print("================================")
+print("")
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+while True:
+
+    ret, raw_frame = cap.read()
+
+
+    if not ret:
+
+        break
+
+
+    # --------------------------------------------------------
+    # IMPORTANT
+    #
+    # Keep raw frame for FASHN.
+    # Display remains mirrored.
+    # --------------------------------------------------------
+
+    model_photo = (
+        raw_frame.copy()
+    )
+
+
+    frame = cv2.flip(
+        raw_frame,
+        1
+    )
+
+
+    window_height, window_width = (
+        frame.shape[:2]
+    )
+
+
+    # ========================================================
+    # MEDIAPIPE
+    # ========================================================
+
+    rgb = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB
+    )
+
+
+    results = pose.process(
+        rgb
+    )
+
+
+    # ========================================================
+    # LIVE AR PREVIEW
+    # ========================================================
+
+    if results.pose_landmarks:
+
+        landmarks = (
+            results.pose_landmarks.landmark
+        )
+
+
+        left_shoulder = landmarks[
+            mp_pose.PoseLandmark.LEFT_SHOULDER.value
+        ]
+
+        right_shoulder = landmarks[
+            mp_pose.PoseLandmark.RIGHT_SHOULDER.value
+        ]
+
+        left_ear = landmarks[
+            mp_pose.PoseLandmark.LEFT_EAR.value
+        ]
+
+        right_ear = landmarks[
+            mp_pose.PoseLandmark.RIGHT_EAR.value
+        ]
+
+
+        if (
+
+            left_shoulder.visibility
+            > 0.5
+
+            and
+
+            right_shoulder.visibility
+            > 0.5
+
+        ):
+
+            left_point = (
+
+                int(
+                    left_shoulder.x
+                    * window_width
+                ),
+
+                int(
+                    left_shoulder.y
+                    * window_height
+                )
+
+            )
+
+
+            right_point = (
+
+                int(
+                    right_shoulder.x
+                    * window_width
+                ),
+
+                int(
+                    right_shoulder.y
+                    * window_height
+                )
+
+            )
+
+
+            shoulder_center = (
+
+                int(
+
+                    (
+                        left_point[0]
+                        +
+                        right_point[0]
+                    )
+                    /
+                    2
+
+                ),
+
+                int(
+
+                    (
+                        left_point[1]
+                        +
+                        right_point[1]
+                    )
+                    /
+                    2
+
+                )
+
+            )
+
+
+            shoulder_width = distance(
+
+                left_point,
+
+                right_point
+
+            )
+
+
+            # ------------------------------------------------
+            # NECK
+            # ------------------------------------------------
+
+            if (
+
+                left_ear.visibility
+                > 0.3
+
+                and
+
+                right_ear.visibility
+                > 0.3
+
+            ):
+
+                left_ear_point = (
+
+                    int(
+                        left_ear.x
+                        *
+                        window_width
+                    ),
+
+                    int(
+                        left_ear.y
+                        *
+                        window_height
+                    )
+
+                )
+
+
+                right_ear_point = (
+
+                    int(
+                        right_ear.x
+                        *
+                        window_width
+                    ),
+
+                    int(
+                        right_ear.y
+                        *
+                        window_height
+                    )
+
+                )
+
+
+                ear_center = (
+
+                    int(
+
+                        (
+                            left_ear_point[0]
+                            +
+                            right_ear_point[0]
+                        )
+                        /
+                        2
+
+                    ),
+
+                    int(
+
+                        (
+                            left_ear_point[1]
+                            +
+                            right_ear_point[1]
+                        )
+                        /
+                        2
+
+                    )
+
+                )
+
+
+                neck_y = int(
+
+                    ear_center[1]
+                    *
+                    0.35
+
+                    +
+
+                    shoulder_center[1]
+                    *
+                    0.65
+
+                )
+
+            else:
+
+                neck_y = int(
+
+                    shoulder_center[1]
+
+                    -
+
+                    shoulder_width
+                    *
+                    0.15
+
+                )
+
+
+            neck_x = shoulder_center[0]
+
+
+            # ------------------------------------------------
+            # CLOTHING
+            # ------------------------------------------------
+
+            cloth_name, cloth_original, cloth_path = clothes[
+                current_cloth
+            ]
+
+
+            cloth = prepare_cloth(
+                cloth_original.copy()
+            )
+
+
+            cloth_width = int(
+
+                shoulder_width
+                *
+                1.75
+
+            )
+
+
+            cloth = resize_cloth(
+
+                cloth,
+
+                cloth_width
+
+            )
+
+
+            cloth_x = int(
+
+                neck_x
+                -
+                cloth.shape[1]
+                /
+                2
+
+            )
+
+
+            cloth_y = int(
+
+                neck_y
+
+                -
+
+                shoulder_width
+                *
+                0.05
+
+            )
+
+
+            frame = overlay_transparent(
+
+                frame,
+
+                cloth,
+
+                cloth_x,
+
+                cloth_y
+
+            )
+
+
+            cv2.putText(
+
+                frame,
+
+                "BODY DETECTED",
+
+                (20, 40),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.8,
+
+                (0, 255, 0),
+
+                2
+
+            )
+
+
+            text = (
+
+                f"{current_cloth + 1}/"
+                f"{len(clothes)} "
+                f"{cloth_name}"
+
+            )
+
+
+            cv2.putText(
+
+                frame,
+
+                text,
+
+                (20, 75),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.6,
+
+                (255, 255, 255),
+
+                2
+
+            )
+
+
+            if show_landmarks:
+
+                mp_draw.draw_landmarks(
+
+                    frame,
+
+                    results.pose_landmarks,
+
+                    mp_pose.POSE_CONNECTIONS
+
+                )
+
+
+        else:
+
+            cv2.putText(
+
+                frame,
+
+                "BODY NOT CLEAR",
+
+                (20, 40),
+
+                cv2.FONT_HERSHEY_SIMPLEX,
+
+                0.8,
+
+                (0, 0, 255),
+
+                2
+
+            )
+
+    else:
+
+        cv2.putText(
+
+            frame,
+
+            "NO BODY DETECTED",
+
+            (20, 40),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.8,
+
+            (0, 0, 255),
+
+            2
+
+        )
+
+
+    # ========================================================
+    # TAKE PHOTO
+    # ========================================================
+
+    if take_photo:
+
+        timestamp = datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S"
+        )
+
+
+        filename = (
+            f"original_model_{timestamp}.jpg"
+        )
+
+
+        path = (
+            PHOTO_FOLDER
+            /
+            filename
+        )
+
+
+        # IMPORTANT:
+        # save raw camera photo only
+        # no virtual clothing
+        # no buttons
+        # no tracking
+        cv2.imwrite(
+
+            str(path),
+
+            model_photo,
+
+            [
+                cv2.IMWRITE_JPEG_QUALITY,
+                95
+            ]
+
+        )
+
+
+        original_model_path = (
+            str(path)
+        )
+
+
+        print("")
+        print("================================")
+        print("NEW MODEL PHOTO SAVED")
+        print("================================")
+        print("")
+        print(
+            original_model_path
+        )
+        print("")
+        print(
+            "This ONE photo will be used"
+        )
+        print(
+            "for all garments."
+        )
+        print("")
+
+
+        take_photo = False
+
+
+        # FASHN
+        process_current_cloth()
+
+
+    # ========================================================
+    # BUTTONS
+    # ========================================================
+
+    # --------------------------------------------------------
+    # LAST PHOTO
+    # --------------------------------------------------------
+
+    cv2.rectangle(
+
+        frame,
+
+        (
+            window_width // 2 - 110,
+            window_height - 125
+        ),
+
+        (
+            window_width // 2 + 110,
+            window_height - 75
+        ),
+
+        (50, 50, 50),
+
+        -1
+
+    )
+
+
+    cv2.putText(
+
+        frame,
+
+        "LAST PHOTO",
+
+        (
+            window_width // 2 - 80,
+            window_height - 92
+        ),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.55,
+
+        (255, 255, 255),
+
+        2
+
+    )
+
+
+    # --------------------------------------------------------
+    # PREVIOUS
+    # --------------------------------------------------------
+
+    cv2.rectangle(
+
+        frame,
+
+        (
+            20,
+            window_height - 125
+        ),
+
+        (
+            220,
+            window_height - 75
+        ),
+
+        (50, 50, 50),
+
+        -1
+
+    )
+
+
+    cv2.putText(
+
+        frame,
+
+        "PREVIOUS",
+
+        (
+            55,
+            window_height - 92
+        ),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.65,
+
+        (255, 255, 255),
+
+        2
+
+    )
+
+
+    # --------------------------------------------------------
+    # NEXT
+    # --------------------------------------------------------
+
+    cv2.rectangle(
+
+        frame,
+
+        (
+            window_width - 220,
+            window_height - 125
+        ),
+
+        (
+            window_width - 20,
+            window_height - 75
+        ),
+
+        (50, 50, 50),
+
+        -1
+
+    )
+
+
+    cv2.putText(
+
+        frame,
+
+        "NEXT",
+
+        (
+            window_width - 150,
+            window_height - 92
+        ),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.65,
+
+        (255, 255, 255),
+
+        2
+
+    )
+
+
+    # --------------------------------------------------------
+    # HIDE TRACKING
+    # --------------------------------------------------------
+
+    cv2.rectangle(
+
+        frame,
+
+        (
+            20,
+            window_height - 65
+        ),
+
+        (
+            230,
+            window_height - 15
+        ),
+
+        (50, 50, 50),
+
+        -1
+
+    )
+
+
+    cv2.putText(
+
+        frame,
+
+        "HIDE TRACKING",
+
+        (
+            35,
+            window_height - 32
+        ),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.55,
+
+        (255, 255, 255),
+
+        2
+
+    )
+
+
+    # --------------------------------------------------------
+    # TAKE PHOTO
+    # --------------------------------------------------------
+
+    cv2.rectangle(
+
+        frame,
+
+        (
+            window_width - 230,
+            window_height - 65
+        ),
+
+        (
+            window_width - 20,
+            window_height - 15
+        ),
+
+        (50, 50, 50),
+
+        -1
+
+    )
+
+
+    cv2.putText(
+
+        frame,
+
+        "TAKE PHOTO",
+
+        (
+            window_width - 190,
+            window_height - 32
+        ),
+
+        cv2.FONT_HERSHEY_SIMPLEX,
+
+        0.6,
+
+        (255, 255, 255),
+
+        2
+
+    )
+
+
+    # ========================================================
+    # DISPLAY
+    # ========================================================
+
+    cv2.imshow(
+
+        "AR Virtual Fitting Mirror",
+
+        frame
+
+    )
+
+
+    key = cv2.waitKey(1) & 0xFF
+
+
+    # ========================================================
+    # QUIT
+    # ========================================================
+
+    if key in (
+        ord("q"),
+        ord("Q"),
+        27
+    ):
+
+        break
+
+
+    # ========================================================
+    # DEBUG TRACKING
+    # ========================================================
+
+    if key in (
+        ord("d"),
+        ord("D")
+    ):
+
+        show_landmarks = (
+            not show_landmarks
+        )
+
+
+    # ========================================================
+    # KEYBOARD TAKE PHOTO
+    # ========================================================
+
+    if key in (
+        ord("p"),
+        ord("P")
+    ):
+
+        take_photo = True
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+cap.release()
+
+cv2.destroyAllWindows()
+
+pose.close()
+
+
+print("")
+print(
+    "AR Virtual Fitting Mirror stopped."
+)
+print("")
